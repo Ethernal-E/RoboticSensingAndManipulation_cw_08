@@ -22,7 +22,8 @@ solution is contained within the cw1_team_<your_team_number> package */
 #include "cw1_world_spawner/srv/task1_service.hpp"
 #include "cw1_world_spawner/srv/task2_service.hpp"
 #include "cw1_world_spawner/srv/task3_service.hpp"
-
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
 namespace moveit::core
 {
 class RobotState;
@@ -72,7 +73,10 @@ public:
   rclcpp::CallbackGroup::SharedPtr service_cb_group_;
   rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_cloud_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 
   // Sensor callback state bookkeeping for template diagnostics.
   std::atomic<int64_t> latest_joint_state_stamp_ns_{0};

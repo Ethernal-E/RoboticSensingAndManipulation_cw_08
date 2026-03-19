@@ -356,6 +356,14 @@ cw1::t2_callback(
   const std::shared_ptr<cw1_world_spawner::srv::Task2Service::Request> request,
   std::shared_ptr<cw1_world_spawner::srv::Task2Service::Response> response)
 {
+
+  if(!latest_cloud_)
+  {
+    RCLCPP_ERROR(node_->get_logger(),"No pointcloud received");
+    return;
+  }
+
+
   RCLCPP_INFO(node_->get_logger(),"Task2 started");
 
   auto arm = moveit::planning_interface::MoveGroupInterface(node_, "panda_arm");
@@ -364,118 +372,124 @@ cw1::t2_callback(
   arm.setEndEffectorLink("panda_hand");
   arm.setPlanningTime(5.0);
 
+  // ---------- Step1: scan environment ----------
   std::vector<geometry_msgs::msg::Pose> views;
+
   views.push_back(make_pose(0.4,0.3,0.6));
   views.push_back(make_pose(0.4,0.0,0.6));
   views.push_back(make_pose(0.4,-0.3,0.6));
-
-  std::vector<std::string> results(request->basket_locs.size(), "none");
-  std::vector<int> best_counts(request->basket_locs.size(), 0);
 
   for(const auto &v : views)
   {
     move_arm_to_pose(arm,v);
     rclcpp::sleep_for(std::chrono::milliseconds(800));
+  }
 
-    if(!latest_cloud_) continue;
+  // ---------- Step2: check cloud ----------
+  if(!latest_cloud_)
+  {
+    RCLCPP_ERROR(node_->get_logger(),"No cloud received");
+    return;
+  }
+  RCLCPP_INFO(node_->get_logger(),
+  "Cloud frame: %s", latest_cloud_->header.frame_id.c_str());
 
-    for(size_t i=0;i<request->basket_locs.size();i++)
+  std::vector<std::string> results;
+
+  for(const auto &loc : request->basket_locs)
+  {
+    geometry_msgs::msg::PointStamped cam_point;
+    geometry_msgs::msg::PointStamped world_point = loc;
+
+    world_point.header.stamp = rclcpp::Time(0);
+
+    try
     {
-      geometry_msgs::msg::PointStamped cam_point;
-
-      try
-      {
-        auto world_point = request->basket_locs[i];
-        world_point.header.stamp = rclcpp::Time(0);
-
-        cam_point = tf_buffer_.transform(
+      cam_point = tf_buffer_.transform(
           world_point,
           latest_cloud_->header.frame_id,
           tf2::durationFromSec(1.0));
-      }
-      catch(...)
+          
+    }
+    catch(tf2::TransformException &ex)
+    {
+      RCLCPP_WARN(node_->get_logger(),"TF failed: %s", ex.what());
+      results.push_back("none");
+      continue;
+    }
+
+    double target_x = cam_point.point.x;
+    double target_y = cam_point.point.y;
+
+    double r_sum=0;
+    double g_sum=0;
+    double b_sum=0;
+
+    int count=0;
+
+    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*latest_cloud_,"x");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*latest_cloud_,"y");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_z(*latest_cloud_,"z");
+
+    sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_r(*latest_cloud_,"r");
+    sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_g(*latest_cloud_,"g");
+    sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_b(*latest_cloud_,"b");
+
+    for(; iter_x != iter_x.end();
+        ++iter_x, ++iter_y, ++iter_z, ++iter_r, ++iter_g, ++iter_b)
+    {
+      double dx = *iter_x - target_x;
+      double dy = *iter_y - target_y;
+      
+
+      double dist = std::sqrt(dx*dx + dy*dy);
+
+      if(dist < 0.1)
       {
-        continue;
-      }
+        r_sum += *iter_r;
+        g_sum += *iter_g;
+        b_sum += *iter_b;
 
-      double tx = cam_point.point.x;
-      double ty = cam_point.point.y;
-
-      double r_sum=0, g_sum=0, b_sum=0;
-      int count=0;
-
-      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*latest_cloud_,"x");
-      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*latest_cloud_,"y");
-      sensor_msgs::PointCloud2ConstIterator<float> iter_z(*latest_cloud_,"z");
-      sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_r(*latest_cloud_,"r");
-      sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_g(*latest_cloud_,"g");
-      sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_b(*latest_cloud_,"b");
-
-      for(; iter_x != iter_x.end();
-          ++iter_x, ++iter_y, ++iter_z, ++iter_r, ++iter_g, ++iter_b)
-      {
-        double dx = *iter_x - tx;
-        double dy = *iter_y - ty;
-        double dist = std::sqrt(dx*dx + dy*dy);
-
-        
-        if(dist < 0.08 && *iter_z > 0.02)
-        {
-          r_sum += *iter_r;
-          g_sum += *iter_g;
-          b_sum += *iter_b;
-          count++;
-        }
-      }
-
-      
-      if(count < 30) continue;
-
-      double r = r_sum / count;
-      double g = g_sum / count;
-      double b = b_sum / count;
-
-      
-      double total = r + g + b;
-
-      if(total < 200) continue;  
-
-      std::string color;
-
-      
-      if(r > 120 && b > 120 && g < 120)
-        color = "purple";
-      else if(r > b + 40 && r > g + 40)
-        color = "red";
-      else if(b > r + 40 && b > g + 40)
-        color = "blue";
-      else
-        continue;
-
-      
-      if(count > best_counts[i])
-      {
-        best_counts[i] = count;
-        results[i] = color;
+        count++;
       }
     }
+
+    if(count < 8)
+    {
+      results.push_back("none");
+      continue;
+    }
+
+    double r = r_sum / count;
+    double g = g_sum / count;
+    double b = b_sum / count;
+
+    if(r > 150 && b > 150)
+      results.push_back("purple");
+    else if(r > b)
+      results.push_back("red");
+    else
+      results.push_back("blue");
   }
 
   response->basket_colours = results;
-
-  for(size_t i=0;i<results.size();i++)
+  for(size_t i = 0; i < results.size(); i++)
   {
     RCLCPP_INFO(node_->get_logger(),
-      "Basket %ld -> %s (points=%d)",
-      i,
-      results[i].c_str(),
-      best_counts[i]);
+    "Basket %ld at (%.2f, %.2f) -> %s",
+    i,
+    request->basket_locs[i].point.x,
+    request->basket_locs[i].point.y,
+    results[i].c_str());
   }
 
   RCLCPP_INFO(node_->get_logger(),"Task2 finished");
+
 }
 
+
 ///////////////////////////////////////////////////////////////////////////////
+
 void
 cw1::t3_callback(
   const std::shared_ptr<cw1_world_spawner::srv::Task3Service::Request> request,
